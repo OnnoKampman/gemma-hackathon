@@ -6,6 +6,9 @@ SENIOR_CHAT_ID = None
 # "onboarding" -> "awaiting_senior" -> "senior_intro" -> "suggesting" -> "followup"
 PHASE = "onboarding"
 
+CONSENT_AT = None      # the caregiver attests the senior agreed to be contacted
+DRAFT_INTRO = None     # first message, shown to the caregiver before it is sent
+
 PROFILE = {
     "name": None,
     "preferred_name": None,
@@ -27,9 +30,20 @@ PROFILE = {
 ONBOARD_HISTORY = []   # [{"role": "user"|"model", "text": str}]
 SENIOR_HISTORY = []
 
-SUGGESTIONS = []       # [{"event_id", "type", "rationale_text", "status"}]
+SUGGESTIONS = []       # [{"event_id", "type", "rationale_text"}], ranked
+OFFER_INDEX = 0        # which of the three is on the table right now
+DECLINED = []          # event ids they've said no to this conversation
 CONFIRMED_EVENT = None
 FEEDBACK = {}
+
+FOLLOWUP_STEP = "did_go"   # which question the follow-up is on
+MEMORY = ""                # rolling narrative summary, feeds the next cycle
+NUDGED = False             # one gentle nudge per follow-up, then drop it
+
+# Escalation counters (spec §8). Cheap to keep, and they are what the
+# hackathon build is meant to demo -- the distress trigger lives in senior_chat.
+CYCLES_NO_RESPONSE = 0
+CYCLES_ALL_DECLINED = 0
 
 METRICS = {
     "connection_count_before": 1,

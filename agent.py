@@ -70,15 +70,23 @@ child. Different register from the senior entirely: direct, data-forward, low
 ceremony. They want facts fast, not the unhurried pacing. Plain English, no
 Singlish. Still short, still no filler."""
 
-# Three questions, and only three. Each one earns its place:
-#   1 -> the role match, which is the point of the product
-#   2 -> the emotional hook the suggestion hangs on
-#   3 -> the practical filter
-ONBOARD_QUESTIONS = [
-    "What did they do for work, and what are they good at that other people aren't?",
-    "What did they love doing when they were younger, that they've stopped?",
-    "How far can they get -- walking distance, one bus, further? And mornings or afternoons?",
-]
+# Onboarding runs until these are known, not for a fixed number of turns.
+# Each one is load-bearing downstream; nothing else is asked for.
+REQUIRED_FIELDS = {
+    "name": "the senior's name -- what to call them",
+    "caregiver_name": "the caregiver's own name, so Jio can open on the family relationship",
+    "skills": "what they are good at -- decides the volunteering role, the point of the product",
+    "past_interests": "what they loved and stopped doing -- the hook a suggestion hangs on",
+    "mobility_radius": "how far they will travel: walking distance, one bus, or further",
+    "preferred_times": "mornings or afternoons",
+    "avoidances": "stairs, heat, loud rooms, certain days -- the safety filter",
+}
+
+OPENING_QUESTION = ("Tell me about them -- what did they do for work, and what are "
+                    "they good at that other people aren't?")
+
+# A caregiver who keeps giving vague answers must not be trapped in a loop.
+MAX_ONBOARD_TURNS = 6
 
 _ONBOARD_SYSTEM = f"""{JIO}
 
@@ -86,14 +94,20 @@ _ONBOARD_SYSTEM = f"""{JIO}
 
 They are setting Jio up on their parent's behalf. The senior is not in this chat.
 
-There are exactly THREE questions and you have been told which one to ask next.
-Ask ONLY that one. Do not add follow-ups, do not ask for clarification, do not
-invent extra questions -- not even if their answer was short or vague. Whatever
-they give you is enough. Take it and move on.
+You are told which facts are still missing. Ask about them and nothing else.
+Never ask about something already known. Never ask for detail you do not need.
 
-Acknowledge what they just said in a few words, then ask the next question.
-Pull every field you can from what they said, including ones a later question
-would have covered.
+Cover at most TWO missing things in one question, and only where they sit
+together naturally ("How far can they get, and mornings or afternoons?"). This
+should be over in about three exchanges -- a caregiver doing this on their lunch
+break will abandon a long interview, and an abandoned onboarding means the
+senior is never contacted at all.
+
+Acknowledge what they just said in a few words, then ask. Pull every field you
+can from their answer, including ones you had not asked about yet.
+
+If they say there is nothing to avoid, record avoidances as ["none"] -- that is
+an answer, not a blank.
 
 Reply with JSON only:
 {{"reply": "<what Jio says, under 40 words>",
@@ -144,30 +158,59 @@ def _json_call(system: str, contents) -> dict:
         return {"reply": (resp.text or "").strip()[:300], "profile_patch": {}}
 
 
-def onboard_turn(history, text=None, audio=None) -> tuple[str, dict, bool]:
+def missing_fields(profile: dict) -> list[str]:
+    """Fields still worth asking about. Nothing cosmetic belongs here -- a field
+    that can be inferred must never make the caregiver answer twice."""
+    return [f for f in REQUIRED_FIELDS if not profile.get(f)]
+
+
+def onboard_turn(profile, history, text=None, audio=None) -> tuple[str, dict, bool]:
     """-> (reply, profile_patch, complete)
 
-    `history` must NOT yet contain the message being handled. The question index
-    and completion are counted here rather than left to the model, which given
-    the chance will keep asking questions until the caregiver gives up.
-    """
-    answered = sum(1 for h in history if h["role"] == "user")  # before this one
-    asking = answered + 1                                      # 0-based next question
-    complete = asking >= len(ONBOARD_QUESTIONS)
+    Onboarding ends when the required fields are known, not after a set number
+    of questions. Completion is decided here from the profile rather than by the
+    model, which given the chance will keep interviewing until the caregiver
+    gives up.
 
-    if complete:
-        instruction = ("That was the last question. Thank them, say you have enough, "
-                       "and tell them to send /link so you can message their parent. "
-                       "Ask nothing further.")
-    else:
-        instruction = f'Ask exactly this next, in your own words: "{ONBOARD_QUESTIONS[asking]}"'
+    `history` must NOT yet contain the message being handled.
+    """
+    turns = sum(1 for h in history if h["role"] == "user") + 1
+    last_turn = turns >= MAX_ONBOARD_TURNS
+    gaps = missing_fields(profile)
+
+    wanted = "; ".join(f"{f} ({REQUIRED_FIELDS[f]})" for f in gaps) or "nothing"
+    instruction = (
+        f"Before this message you were still missing, in priority order: {wanted}.\n"
+        "Extract everything you can from what they just said, then ask about the "
+        "FIRST one or two you are STILL missing -- work down that list in order, "
+        "the early ones matter most.")
 
     contents = _contents(history, text, audio)
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(
-        text=f"[instruction to Jio, not from the caregiver] {instruction}")]))
+    data = _json_call(_ONBOARD_SYSTEM, contents + [types.Content(
+        role="user", parts=[types.Part.from_text(
+            text=f"[instruction to Jio, not from the caregiver] {instruction}")])])
 
-    data = _json_call(_ONBOARD_SYSTEM, contents)
-    return data.get("reply", ""), data.get("profile_patch", {}), complete
+    patch = data.get("profile_patch", {})
+    after = dict(profile)
+    for key, value in patch.items():
+        if value not in (None, "", [], {}):
+            after[key] = value
+    complete = (not missing_fields(after)) or last_turn
+    if not complete:
+        return data.get("reply", ""), patch, False
+
+    # The reply above was written while the model still thought something was
+    # missing, so it ends on a question. Now that the profile is actually full,
+    # the closing line is generated separately -- otherwise the caregiver gets
+    # "...and what did he do for work?" alongside "that's everything".
+    close = _json_call(_ONBOARD_SYSTEM, contents + [types.Content(
+        role="user", parts=[types.Part.from_text(text=(
+            "[instruction to Jio, not from the caregiver] You now have everything "
+            "you need. Confirm back the one or two things that matter most, and "
+            "say that's enough. Ask NOTHING further -- no question of any kind, "
+            "not even a polite one. Do not mention a link; they are about to be "
+            "shown a button for that."))])])
+    return close.get("reply", ""), patch, True
 
 
 def senior_intro(profile: dict) -> str:
@@ -193,18 +236,127 @@ Under 80 words. Reply with JSON: {{"reply": "..."}}"""
     return _json_call(system, contents).get("reply", "")
 
 
-def senior_chat(profile: dict, history, text=None, audio=None) -> tuple[str, dict]:
+_OFFER_RULES = """How an offer is made -- this is the heart of the product:
+
+Say it like someone who knows them, because you do. Every offer names the
+specific thing in their own history that makes it fit -- the job they did, the
+game they stopped playing, the thing they are good at. Never a generic pitch.
+A memory callback justifies the match; it is not decoration.
+
+Motivating, never pushy. The pull is that they are wanted somewhere specific, at
+a specific time, for something only they can do -- not that it would be good for
+them. Never mention loneliness, health benefits, or getting out more.
+
+Concrete. Day, time, block, what's needed. Fragments, not full sentences.
+End with an easy way to say yes.
+
+Speak as "I", never "Jio will..." about yourself."""
+
+
+def open_offer(profile: dict, intro: str, offer: dict, event: dict) -> str:
+    """The week's opener plus the first suggestion, in one voice note."""
+    system = f"""{JIO}
+
+{SENIOR_REGISTER}
+
+{_OFFER_RULES}
+
+Open the week and make the FIRST offer, in one short message under 70 words.
+Mention {profile.get('caregiver_name') or 'their child'} once, lightly -- they
+are why Jio is here, and hearing that name is what makes this trustworthy rather
+than a cold approach. Do not labour it.
+
+Their profile:
+{json.dumps(profile, indent=2)}
+
+The event:
+{json.dumps(event, indent=2)}
+
+Why it fits them: {offer.get('rationale_text', '')}
+Suggested opener: {intro}
+
+Reply with JSON: {{"reply": "..."}}"""
+    return _json_call(system, [types.Content(role="user", parts=[types.Part.from_text(
+        text="Write the opening offer.")])]).get("reply", "")
+
+
+def suggestion_turn(profile: dict, current: dict, nxt: dict, history,
+                    text=None, audio=None) -> tuple[str, str]:
+    """Read their answer to the offer on the table. -> (reply, decision)
+
+    decision: accepted | declined | unclear
+    """
+    if nxt:
+        pivot = (f"If they declined, acknowledge it, ask lightly what was off "
+                 f"-- not your thing, or bad timing? -- and in the same breath "
+                 f"move to this one instead:\n{json.dumps(nxt, indent=2)}\n"
+                 "Make it feel like a better idea, not a consolation prize.\n"
+                 "There IS another suggestion left, so you must not close the "
+                 "conversation here, however many times they have already said "
+                 "no. Offering a different kind of thing is not pushing -- "
+                 "pushing would be arguing with the no you just heard.")
+    else:
+        pivot = ("If they declined, that was the last one. Close warmly and "
+                 "briefly: no guilt, no comment on the pattern, no pressure. Say "
+                 "you'll look for something different next week. Do not offer "
+                 "anything else, and do not ask them to reconsider.")
+
+    system = f"""{JIO}
+
+{SENIOR_REGISTER}
+
+{_OFFER_RULES}
+
+This is on the table right now:
+{json.dumps(current, indent=2)}
+
+Their profile:
+{json.dumps(profile, indent=2)}
+
+Decide what they just said about it:
+- "accepted": any yes, however hedged -- "okay lah", "can", "why not", "I'll try"
+- "declined": any no, or a reason that amounts to no
+- "unclear": a question, a tangent, or something you genuinely cannot read
+
+If accepted: confirm warmly and practically -- day, time, where, who to look for.
+Nothing else.
+{pivot}
+If unclear: answer what they actually said, then put the same offer back gently.
+Never treat hesitation or a question as a refusal.
+
+Reply with JSON:
+{{"reply": "<under 50 words>", "decision": "accepted|declined|unclear"}}"""
+    data = _json_call(system, _contents(history, text, audio))
+    decision = data.get("decision", "unclear")
+    return data.get("reply", ""), decision if decision in ("accepted", "declined", "unclear") else "unclear"
+
+
+def senior_chat(profile: dict, history, text=None, audio=None,
+                events: list | None = None, confirmed: dict | None = None) -> tuple[str, dict]:
     """Free conversation with the senior, outside the follow-up loop.
 
     This is where the guide's edge cases live: refusal, off-topic, distress,
     "are you a robot", and re-contact after silence.
+
+    `events` and `confirmed` matter more than they look: this runs *after* an
+    activity is accepted, so "what time was that again?" arrives here. Without
+    them Jio cannot answer a question about the thing it just signed them up for.
     """
+    booked = (f"\nThey have said yes to this, and it is the most likely thing they "
+              f"are asking about:\n{json.dumps(confirmed, indent=2)}\n" if confirmed else "")
+    catalogue = (f"\nEverything on locally, for answering questions about what's "
+                 f"available:\n{json.dumps(events, indent=2)}\n" if events else "")
+
     system = f"""{JIO}
 
 {SENIOR_REGISTER}
 
 You are in ordinary conversation with the senior. Their profile:
 {json.dumps(profile, indent=2)}
+{booked}{catalogue}
+Answer practical questions -- when, where, how to get there, who to ask for --
+straight from the details above. Never invent a time, a place or a name, and
+never guess: if it is not written above, say you'll check and come back to them.
 
 Apply the guide's sections as the situation calls for them -- "Handling
 refusal", "Off-topic requests", "Distress", "Self-reference", "Silence /
@@ -236,7 +388,7 @@ Reply with JSON: {{"reply": "<under 40 words>", "escalate": <bool>,
     return data.get("reply", ""), data
 
 
-def suggest(profile: dict, events: list) -> list[dict]:
+def suggest(profile: dict, events: list, memory: str = "") -> list[dict]:
     """Exactly three: one easy yes, one stretch, one role. Spec section 6."""
     system = f"""{JIO}
 
@@ -260,41 +412,123 @@ Reply with JSON:
 {{"intro": "<the weekly opener, per the guide's 'Weekly suggestion opener' -- under 25 words>",
   "suggestions": [{{"event_id": "...", "type": "easy|stretch|role",
                     "rationale_text": "..."}}]}}"""
+    note = (f"\n\nWhat you've learned about them so far -- this outranks the raw "
+            f"profile where they disagree:\n{memory}" if memory else "")
     contents = [types.Content(role="user", parts=[types.Part.from_text(
-        text=f"Profile:\n{json.dumps(profile, indent=2)}\n\nEvents:\n{json.dumps(events, indent=2)}")])]
+        text=f"Profile:\n{json.dumps(profile, indent=2)}{note}"
+             f"\n\nEvents:\n{json.dumps(events, indent=2)}")])]
     data = _json_call(system, contents)
     return data.get("intro", ""), data.get("suggestions", [])
 
 
-def followup_turn(profile: dict, event: dict, history, text=None, audio=None):
-    """24-48h after the event. -> (reply, feedback_patch, done)"""
+# One question per turn, in this order. Never compounded into one voice note.
+FOLLOWUP_STEPS = {
+    "did_go": "Did they go?",
+    "how_was_it": "How was it?",
+    "best_part": "What was the best part?",
+    "disliked": "Anything they didn't like?",
+    "more_or_different": "Do they want more like that, or something different?",
+    "barrier": "What got in the way? Logistics, nerves, health, or did they forget?",
+}
+
+
+def next_followup_step(answering: str, feedback: dict) -> str:
+    """Given the question they just answered, what comes next.
+
+    The branch is the point: someone who didn't go is never marched through
+    questions about an event that didn't happen.
+    """
+    if answering == "open":
+        return "did_go"
+    if answering == "did_go":
+        return "how_was_it" if feedback.get("attended") else "barrier"
+    if answering == "barrier":
+        return "done"
+    order = ["how_was_it", "best_part", "disliked", "more_or_different", "done"]
+    return order[order.index(answering) + 1] if answering in order[:-1] else "done"
+
+
+def followup_turn(profile: dict, event: dict, history, answering: str,
+                  text=None, audio=None) -> tuple[str, dict]:
+    """One turn of the follow-up. -> (reply, feedback_patch)
+
+    `answering` is the question they just replied to -- "open" for the first
+    message. Jio asks whatever comes NEXT, which for did_go depends on what
+    they just said, so the branch is decided in the same generation.
+    """
+    if answering == "open":
+        ask = f"Open the follow-up. Ask exactly one thing: {FOLLOWUP_STEPS['did_go']}"
+    elif answering == "did_go":
+        ask = ("They are telling you whether they went.\n"
+               f"If they DID go, now ask: {FOLLOWUP_STEPS['how_was_it']}\n"
+               f"If they did NOT go, ask ONCE, lightly: {FOLLOWUP_STEPS['barrier']} "
+               "-- no guilt, no disappointment, no hint they should have gone, and "
+               "nothing else about it afterwards.")
+    elif answering == "barrier":
+        ask = ("Take the reason, say nothing more about it, and close. You'll find "
+               "something for next week. Ask nothing further.")
+    else:
+        nxt = next_followup_step(answering, {"attended": True})
+        ask = ("Close the conversation warmly and briefly. Ask nothing further."
+               if nxt == "done" else f"Now ask exactly one thing: {FOLLOWUP_STEPS[nxt]}")
+
     system = f"""{JIO}
 
 {SENIOR_REGISTER}
 
-The senior went (or didn't) to this event:
+They were signed up for this:
 {json.dumps(event, indent=2)}
 
-Follow the guide's "Post-event follow-up" section. Open neutral and factual --
-"How was Wednesday tea?" -- and let their answer set the emotional register,
-then match it. If they are flat or practical, stay practical. Never celebrate
-attendance: praising an adult for turning up lands badly.
+Their profile:
+{json.dumps(profile, indent=2)}
 
-Cover, one at a time: how it was / the best part / anything they didn't like /
-more like that or something different. Also find out how many people they
-actually spoke to face to face -- ask it naturally, never as a survey question.
+Follow the guide's "Post-event follow-up" section. Open neutral and factual, and
+let their answer set the emotional register -- if they are flat or practical,
+stay practical. Never celebrate attendance; praising an adult for turning up
+lands badly.
 
-If they did NOT go, ask ONCE what got in the way, take the answer, and move on.
-No guilt, no second ask.
+ONE question per turn. Never bundle two questions into one voice note, however
+naturally they seem to go together. Acknowledge what they just said in a few
+words first, then ask.
+
+{ask}
+
+If what they said mentions other people, note how many they spoke to face to
+face -- but never ask it as a survey question.
 
 Reply with JSON:
-{{"reply": "<under 40 words>",
+{{"reply": "<under 35 words>",
   "feedback": {{"attended": true|false|null, "enjoyed": [], "disliked": [],
                 "barrier": "logistics|nerves|health|forgot|none|null",
-                "connection_count": <people spoken to face to face, or null>}},
-  "done": <true when all five are covered>}}"""
-    contents = [types.Content(role="user", parts=[types.Part.from_text(
-        text=f"Profile:\n{json.dumps(profile, indent=2)}")])]
-    contents += _contents(history, text, audio)
-    data = _json_call(system, contents)
-    return data.get("reply", ""), data.get("feedback", {}), bool(data.get("done"))
+                "next_interest_signal": "<what they want more or less of, or null>",
+                "connection_count": <people spoken to face to face, or null>}}}}"""
+    data = _json_call(system, _contents(history, text, audio))
+    return data.get("reply", ""), data.get("feedback", {})
+
+
+def update_memory(profile: dict, memory: str, event: dict, feedback: dict) -> str:
+    """Rolling narrative summary. The design is explicit that the next cycle
+    adjusts qualitatively off this, not through a lookup table of rules."""
+    system = f"""You keep a short rolling note about one person, for an agent that
+suggests local activities to them. Rewrite the note to fold in what just
+happened. Keep it under 120 words, plain prose, no bullets, no headings.
+
+Record what actually happened and what it implies for what to suggest next --
+what landed, what didn't, what to avoid offering again. Concrete and specific.
+No sentiment, no speculation about their feelings, no clinical language.
+
+Existing note (may be empty):
+{memory or "(nothing yet)"}
+
+Profile:
+{json.dumps(profile, indent=2)}
+
+They were signed up for:
+{json.dumps(event, indent=2)}
+
+What came back:
+{json.dumps(feedback, indent=2)}
+
+Reply with JSON: {{"reply": "<the rewritten note>"}}"""
+    return _json_call(system, [types.Content(role="user", parts=[types.Part.from_text(
+        text="Rewrite the note.")])]).get("reply", memory or "")
